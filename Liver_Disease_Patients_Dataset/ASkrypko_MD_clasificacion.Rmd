@@ -1,0 +1,1378 @@
+---
+title: "Minería de Datos. Clasificación"
+author: "Aliaksandra Skrypko"
+output: pdf_document
+date: "2023-05-28"
+---
+set.seed(894831)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE)
+```
+
+```{r include=FALSE}
+Sys.setenv(LANGUAGE="es")
+Sys.setlocale("LC_CTYPE", 'es.UTF-8')
+```
+
+```{r include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(rgl)
+library(cluster)
+library(factoextra)
+library(mclust)
+library(rattle)
+library(ROSE)
+library(themis)
+library(ROCit)
+library(randomForest)
+library(RSNNS)
+library(caret)
+```
+
+
+# Load data
+
+El conjunto de datos se corresponde con pacientes hepáticos de India. Cada uno de los pacientes de-identificados se clasifica por unos expertos en dos grupos según poseen la enfermedad hepática genérica o no. Cada uno de los registros se describe según sus carácteristicas generales (edad, sexo) y resultados de analítica de sangre (valores de billirubina, aminotransferasa, albumina, proteinas, etc.). La lista exacta de todas las variables se presenta a continuación.
+
+1. Age Age of the patient
+2. Gender Gender of the patient
+3. TB Total Bilirubin
+4. DB Direct Bilirubin
+5. Alkphos Alkaline Phosphotase
+6. Sgpt Alamine Aminotransferase
+7. Sgot Aspartate Aminotransferase
+8. TP Total Protiens
+9. ALB Albumin
+10. A/G Ratio Albumin and Globulin Ratio
+11. Selector field used to split the data into two sets (labeled by the experts) 
+
+```{r}
+data <- read.csv("ILDP_data.csv",header=FALSE)
+colnames(data ) = c('age','gender','TB','DB', 'Alkphos', 'Sgpt', 'Sgot', 'TP', 'ALB', 'AG', 'Class')
+```
+
+El conjunto en total contiene 583 observaciones, 4 de ellas tienen valores faltantes en la variable AG (ratio albumina-globulina).
+
+A pesar de que existen diferentes técnicas para abordar el problema de valores ausentes, se opta por eliminar directamente las 4 observaciones ya que estas no son una porción significativa del conjunto. Entre las opciones existentes están también la predicción de valores faltantes (por métodos kNN o árboles) o imputación a través de la distribución de la variable en cuestión (medias, medianas, etc.).
+
+```{r}
+sum(apply(data,2,function(x) is.na(x)))
+sum(sapply(data, is.factor))
+```
+```{r}
+data[!complete.cases(data), ]
+```
+
+```{r}
+data <- data[complete.cases(data), ]
+```
+
+Notar que por construcción, si la edad del paciente excede 89 años, se transcribe en la base de datos con la edad 90 independientemente del valor exacto. Sin embargo, esta codificación no es un problema para el análisis ya que solamente un registro tiene valor 90 asignado.
+
+```{r}
+length(which(data$age >= 90))
+```
+
+
+Se convierten las variables Gender y Class en factores y se recodifica la variable Class para que tenga niveles más fácilemnet interpretables: "Si" y "No". La decodificación de las clases "1" y "2" como pacientes con enfermedad hepática y pacientes sin enfermedad hepática respectivamente se hace de acuerdo con la descripción del conjunto de datos proporcionada por los propietarios del conjunto.
+
+```{r}
+data$gender <- as.factor(data$gender)
+data$Class <- as.factor(data$Class)
+```
+
+```{r}
+nrow(data[data$Class == "1", ])
+nrow(data[data$Class == "2", ])
+```
+```{r}
+levels(data$Class)[levels(data$Class)==1] <- "Si"
+levels(data$Class)[levels(data$Class)==2] <- "No"
+data$Class <- factor(as.character(data$Class))
+data$Class <- factor(data$Class, levels = c("Si", "No"))
+```
+
+
+# Analisis preliminar
+
+## Class
+
+```{r}
+n_si <- nrow(data[data$Class == "Si", ])
+n_no <- nrow(data[data$Class == "No", ])
+
+n_si/(n_si+n_no)*100
+n_no/(n_si+n_no)*100
+```
+
+
+
+```{r}
+
+lbls <- c("Si 71.5% \n 414", "No 28.5% \n 165")
+pie(c(n_si,n_no), labels = lbls,  main="Proporción de casos hepáticos en el conjunto")
+
+```
+El estudio de la variable clasificación revela que el conjunto de datos no es balanceado: hay menos de 30% de casos negativos por lo que su predicción va a ser difícil (los modelos no tendrán suficientes casos para generalizar las tendencias). Notar además, que este problema llevará a la necesidad de utilizar diversas métricas para medir la bondad de las predicciones: la exactitud (accuracy) no podrá resumir correctamente las clasificaciones realizadas por los modelos.
+
+Tener en cuenta que la naturaleza del problema implícitamente tiene poca tolerancia a los falsos negativos (casos marcados por el algorítmo como sanos incorrectamente) y mayor tolerancia a los falsos positivos (casos identificados incorrectamente como enfermos). El razonamiento es el siguiente: el modelo claramente no puede usarse para diagnóstico por si solo (esta es la tarea de un médico), pero puede ayudar al médico a marcar casos sospechosos para inverstigación posterior. En este sentido, es mejor ofrecer más pruebas a un paciente sano que no ofrecerle pruebas adicionales (y, potencialmente no identificar la enfermedad) a un paciente hepático. Así, es un punto a tener en cuenta en la evaluación de los modelos predictivos futuros.
+
+## Gender
+
+El género es la única variable factor (salvo la variable de clasificación Class) en el conjunto. Es de tipo binario, siendo sus únicos niveles "Male" y "Female".
+
+```{r}
+n_male <- nrow(data[data$gender == "Male", ])
+n_female <- nrow(data[data$gender == "Female", ])
+
+n_male/(n_male+n_female)*100
+n_female/(n_male+n_female)*100
+```
+```{r}
+lbls <- c("Male 75.8% \n 439", "Female 24.4% \n 140")
+pie(c(n_male,n_female), labels = lbls,  main="Niveles de género en el conjunto")
+```
+
+```{r}
+con1 <- table(data$gender,data$Class)
+con1
+```
+Una representación gráfica de la distribución de pacientes femeninas y masculinos en el conjunto según su clase se ofrece a continuación. Notar el desequilibro notable entre la cantidad de hombres y mujeres en la muestra: los hombres representan más de un 75% de los registros disponibles. Sin embargo la distribución de casos positivos y negativos según género es casi igual en ambos grupos. Se pueden comprobar los valores numéricos en una tabla de proporciones.
+
+```{r}
+
+mosaicplot(con1)
+
+```
+
+
+```{r}
+# by row
+prop.table(con1, margin = 1)
+# by column
+prop.table(con1, margin = 2)
+```
+Un test de tipo chi-cuadrado sobre la tabla de proporciones no rechaza la hipótesis de que la clase sea independiente del gñenero (p-valor = 0.064). De esta forma, no se espera que la variable Gender tenga una influencia importante en las predicciones de modelos de aprendizaje automático.
+
+```{r}
+chisq.test(con1)
+```
+
+Varios modelos y algoritmos que se usarán en el presente trabajo necesitarán que todas las variables explicativas sean de tipo numérico. Para abordar el problema se realiza recodificación de la variable gender con el método de one-hot-encoding. Se crean dos variables en lugar de una: "gender.Female" y "gender.Male" cada una tomara valor 1 si el paciente tiene el género correspondiente.
+
+```{r}
+preProcValues <- preProcess(data, method = c("center", "scale"))
+
+data_norm <- predict(preProcValues, data)
+```
+
+```{r}
+dummy <- dummyVars(" ~ .", data=data[,1:10])
+data_new <- data.frame(predict(dummy, newdata=data))
+data_new <- cbind(data_new, data[,11])
+names(data_new) <- c('age','gender.Female','gender.Male','TB','DB', 'Alkphos', 'Sgpt', 'Sgot', 'TP', 'ALB', 'AG', 'Class')
+data <- data_new
+rm(data_new)
+```
+
+## Variables continuas
+
+Para estudiar con detalle las 9 variables numéricas que están presentes en el conjunto aplicar primero un resumen numérico. Las variables age, Alkphos, Sgpt y Sgot son de tipo entero dentro del conjunto, mientras que las variables TB, DB, TP, ALB y AG son reales con la precisión hasta una cifra decimal. 
+
+```{r}
+summary(data)
+```
+A simple vista de las tablas se destacan variables con muchos valores anómalos: Alkphos, Sgpt, Sgot, DB, TB a simple vista tienen máximos muy por encima de los valores correspondientes a tercer cuartil (ordenes de magnitud superiores). Para examinar en detalle estos casos se estudian gráficamente las distribuciones de las variables numéricas: con gráficas de tipo cajas y distribución.
+
+Comprobar también que ninguna de las variables numéricas tiene varianza nula (ya se apreciaba a simple vista en el resúmen numérico).
+
+```{r}
+nearZeroVar(data,saveMetrics = TRUE)
+```
+
+### Age
+
+No se detectan valores aberrantes en la variable edad. Se observa además, que la distribución de edad dentro de las dos clases de enfermedad es ligeramnete diferente. Un test de Wilcoxon rechaza a p-valor de 0.002 la igualdad de las medianas en los dos grupos.
+
+```{r}
+boxplot(age ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+wilcox.test(age ~ Class, alternative="two.sided", data=data)
+```
+```{r}
+ggplot(data=data, aes(x=age, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+```
+
+
+
+### TB
+
+La variable TB presenta varios valores aberrantes, todos ellos manifestándose en forma de cola larga en la distribución correspondiente. Las distribuciones son además muy diferentes en las dos clases: a los pacientes no-hepáticos les corresponden valores de TB en general menores.
+
+```{r}
+boxTB <- boxplot(TB ~ Class, data=data, id=list(method="y"))
+```
+
+La igualdad de medias en los grupos se rechaza con el test de Wilcoxon.
+
+```{r}
+wilcox.test(TB ~ Class, alternative="two.sided", data=data)
+```
+
+```{r}
+
+ggplot(data=data, aes(x=TB, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+Observar en la figura de la distribución de las variables, los valores de TB en el grupo de pacientes no-hepáticos es mucho mas estrecha con la mayoria de los valores en una banda muy limitada. Por otro lado los pacientes hepáticos están más distribuidos. Ambos presentan colas significativas de valores singulares.
+
+### DB
+
+La variable DB está relacionada conceptualmente con la variable TB anterior: bilirrubina directa y total respectivamente. Sus distribuciones en general presentan los mismos rasgos.
+
+```{r}
+boxDB <- boxplot(DB ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+wilcox.test(DB ~ Class, alternative="two.sided", data=data)
+```
+
+
+```{r}
+
+ggplot(data=data, aes(x=DB, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+### Alkphos
+
+Los mismos grandes rasgos pueden observarse en la variable Alkphos tambien: distribuciones claramente diferentes (valores menores corresponden a pacientes no-hepáticos) y grandes colas en valores altos.
+
+```{r}
+boxplot(Alkphos ~ Class, data=data, id=list(method="y"))
+```
+```{r}
+wilcox.test(Alkphos ~ Class, alternative="two.sided", data=data)
+```
+
+
+```{r}
+
+ggplot(data=data, aes(x=Alkphos, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+### Sgpt y Sgot
+
+Las dos variables se estudian en un conjunto ya que están muy relacionadas entre sí conceptualmente: se trata de diferentes tipos de aminotransferasas.
+
+Las colas de ambas variables son tan amplias que un estudio de diagrama de cajas resulta inútil en este caso. Se aprecian las diferencias entre clases en una gráfica de distribuciones y se confirma con un test de Wilcoxon una diferencia de medianas entre dos grupos a un nivel de significación de 0.05.
+
+```{r}
+boxplot(Sgpt ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+boxplot(Sgot ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+wilcox.test(Sgpt ~ Class, alternative="two.sided", data=data)
+```
+
+```{r}
+wilcox.test(Sgot ~ Class, alternative="two.sided", data=data)
+```
+
+```{r}
+
+ggplot(data=data, aes(x=Sgpt, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+```{r}
+
+ggplot(data=data, aes(x=Sgpt, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+### TP
+
+La variable TP proteinas totales no presenta muchos valores anómalos y la igualdad de medianas por grupos no se rechaza con el test de Wilcoxon. Surgen así las dudas de si la variable tendrá utilidad dentro de los algoritmos de clasificación.
+
+```{r}
+boxplot(TP ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+wilcox.test(TP ~ Class, alternative="two.sided", data=data)
+```
+```{r}
+
+ggplot(data=data, aes(x=TP, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+### ALB
+
+El valor de albumina ALB es otra de las variables sin valores anómalos, y su distribución es significativamente diferente entre clases (p-valor de 10^-5 en el test de Wilcoxon).
+
+
+```{r}
+boxplot(ALB ~ Class, data=data, id=list(method="y"))
+```
+
+
+```{r}
+wilcox.test(ALB ~ Class, alternative="two.sided", data=data)
+```
+```{r}
+
+
+ggplot(data=data, aes(x=ALB, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+
+### AG
+
+La última variable explicativa del conjunto es el ratio de albumina y globulina, siendo así conceptualmente realacionada con la variable anterior ALB. Presenta pocos valores extraños y las colas no son muy apreciables.
+
+```{r}
+boxplot(AG ~ Class, data=data, id=list(method="y"))
+```
+
+```{r}
+wilcox.test(AG ~ Class, alternative="two.sided", data=data)
+```
+
+```{r}
+
+ggplot(data=data, aes(x=AG, group=Class, fill=Class)) +
+    geom_density(adjust=1.5, alpha=.4)
+
+```
+
+### Conslusion
+
+De una simple exploración visual de variables por separado (sin contar posibles correlaciones) se han identificado varios puntos importantes. 
+
+Por un lado, existen en el conjunto las variables (gender y TP) cuyas distribuciones son identicas para los pacientes de diferentes clases. En un sentido estadístico significa que estas variables por si solas no pueden ser usados para predicciones de enfermedad en pacientes, pero no se descarta que su interacción con el resto de las variables las haga útiles para los algoritmos de aprendizaje automático.
+
+Por otro lado, surge un gran problema de valores aberrantes en los conjuntos: las variables TB, DB, Alkphos, Sgpt y Sgot tienen colas muy grandes en sus distribuciones (valores ordenes de magnitud diferentes  a las medias y cuartiles). En estas circunstancias no se puede simplemente eliminar los registros debido a que son muchos los que están afectados por el problema. En total unos 285 registros se encuentran fuera de los "bigotes" de diagramas de cajas de al menos una variable (eso es, fuera de 3Q+1.5*rango intercuartílico).
+
+```{r}
+boxTB <- boxplot(TB ~ Class, data=data, id=list(method="y"), plot=FALSE)
+out_TB <- which(data$TB %in% boxTB$out)
+
+boxDB <- boxplot(DB ~ Class, data=data, id=list(method="y"),plot=FALSE)
+out_DB <- which(data$DB %in% boxDB$out)
+
+boxAlk <- boxplot(Alkphos ~ Class, data=data, id=list(method="y"), plot=FALSE)
+out_Alk <- which(data$Alkphos %in% boxAlk$out)
+
+boxSgpt <- boxplot(Sgpt ~ Class, data=data, id=list(method="y"), plot=FALSE)
+out_Sgpt <- which(data$Sgpt %in% boxSgpt$out)
+
+boxSgot <- boxplot(Sgot ~ Class, data=data, id=list(method="y"), plot=FALSE)
+out_Sgot <- which(data$Sgot %in% boxSgot$out)
+
+outliers <- union(out_TB, out_DB)
+outliers <- union(outliers,out_Alk)
+outliers <- union(outliers,out_Sgpt)
+outliers <- union(outliers,out_Sgot)
+```
+
+
+```{r}
+length(outliers)
+length(out_TB) + length(out_DB) + length(out_Alk) +
+  length(out_Sgpt) + length(out_Sgot)
+```
+## Correlaciones
+
+Se estudia a continuación las posibles correlaciones entre las variables numéricas en el conjunto, al igual que potenciales combinaciones lineales.
+
+```{r}
+
+
+
+panel.cor <- function(x, y){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- round(cor(x, y), digits=2)
+  txt <- paste0("r = ", r)
+  text(0.5, 0.5, txt)
+}
+
+upper.panel<-function(x, y, col){
+points(x,y, pch = 19, col = c("red" ,"green")[data$Class])
+}
+
+pairs(na.omit(data[,c(1,4,5,6,7,8,9,10,11)]),lower.panel = panel.cor,
+      upper.panel = upper.panel,main = "Pairplot")
+
+```
+
+
+
+Noatar correlaciones extremadamente altas entre varios pares de variables: TB y DB (ambas bilirrubina) a r=0.87, Sgpt y Sgot (aminotransferasas) a r=0.79, TP y ALB (bilirrubina y albumina) a r=0.78 y ALB Y AG (albumina y ratio albumina/globulina) a r=0.69.
+
+No existen además en el conjunto variables que sean combianciones lineales de las otras.
+
+```{r}
+findLinearCombos(data[,1:11])
+```
+
+```{r}
+findCorrelation(cor(data[,1:11]), cutoff=.85)
+```
+
+En conclusión al estudio realizado no se decide eliminar las variables altamente correladas del conjunto: el número de variables explicativas actual (10) es bastante reducido y manejable para los métodos de aprendizaje automático convencionales y para el conjunto de datos utilizado puede ser más perjudicial perder la información contenida en estas variables.
+
+Se opta además por no hacer ningún tratamiento específico a los datos para elimianar las colas de las variables que las presentan. Como ya se ha comentado, casi la mitad de registros tienen valores anómalos en una o varias variables. Esto resulta problemático: subrepresentación de valores grandes en la muestra hace que su clasificación sea más difícil y la generalización de modelos a casos extra-muestrales puede fallar. Son las cuestiones a tener en cuenta en la construcción e interpretación de los resultados de aprendizaje automático, pero no se pueden abordar más allá de esto (por ejemplo, lo ideal sería añadir a la muestra más registros de pacientes para nivelar las colas aberrantes).
+
+## PCA
+
+Una vez estudiadas las variables por separado y en correlación, se analizan los patrones internos y agrupaciones potenciales dentro del conjunto. Una de las técnicas usuales para ello es el análisis de las componentes principales PCA.
+
+Se opta por normalizar y escalar todos los datos antes de pasarlos por el análisis PCA. El cálculo realizado indica que las dos primeras componentes principales solo explican un 53% de variabilidad en la muestra, un resultado muy bajo.
+
+```{r}
+preProcValues <- preProcess(data, method = c("center", "scale"))
+data_norm <- predict(preProcValues, data)
+```
+
+
+```{r}
+data.PC <- princomp(~age + gender.Female + gender.Male + TB + DB + Alkphos + Sgpt + Sgot + TP + ALB + AG, cor=TRUE, 
+  data=data_norm)
+  cat("\nComponent loadings:\n")
+  print(unclass(loadings(data.PC)))
+```
+```{r}
+print(summary(data.PC))
+```
+
+
+```{r}
+plot(data.PC, type="lines")
+
+```
+La representación gráfica 2D no revela clustering natural de los datos,
+
+```{r}
+
+biplot(data.PC)
+
+```
+Una representación en 3D (indicados también diferentes clases en diferentes colores) muestra que los caos postivos y negativos forman una agrupación muy entremezclada en la vecindad de una recta. Adicionalmente varios casos positivos se alejan de la recta sin mucho patrón (quizá se trata de los outliers de colas, más frecientes entre casos positivos).
+
+```{r}
+levels(data_norm$Class)[levels(data_norm$Class)=="Si"] <- 1
+levels(data_norm$Class)[levels(data_norm$Class)=="No"] <- 2
+data_norm$Class <- factor(as.character(data_norm$Class))
+data_norm$Class <- factor(data_norm$Class, levels = c(1, 2))
+plot3d(data.PC$scores[,1:3], col=data_norm$Class)
+```
+
+Los resultados del estudio en componentes principales debe tomarse seriamente: una técnica tan potente como es el PCA en 3 componentes principales (casi un 62% de variablidad de la muestra) ofrece una separación de datos en dos clústers (correspondientes a los pacientes masculinos y femeninos) que tienen aproximadamente la misma forma triangular. Los casos no hepáticos están concentrados en las bases de los triángulos muy entremezclados con los pacientes no hepáticos. De ahí surgen dudas de si puede existir un clasificador potente sobre el conjunto de datos: los casos de ambas clases se parecen mucho entre sí.
+
+## Clustering
+
+En linea con lo comentado sobre la técnica de PCA analizamos también posible clustering de los datos con métodos tipo k-means.
+
+```{r}
+set.seed(894831)
+fit_means <- kmeans(na.omit(data_norm[,1:11]), 4)
+```
+
+```{r}
+clusplot(data, fit_means$cluster, color=TRUE, shade=TRUE,
+   labels=2, lines=0)
+
+```
+El número de clusters se ha seleccionado empíricamente como 4, pero no se observa que el modelo haga una diferenciación significativa en la región más densamente poblada donde realmente importa la separación.
+
+Un estudio de distancias entre los registros puede ofrecer una visión general de si es necesario usar más o menos clusteres. De la figura siguiente se destacan aproximadamente 5 clusters (caudrados de color similar con sobre la diagonal de la tabla).
+
+```{r}
+class_clust <- data_norm[,12]
+data_clust <- data_norm[,1:11]
+```
+
+```{r}
+
+fviz_dist(dist(data_clust), show_labels = FALSE)+labs(title = "Scaled")
+
+```
+
+```{r}
+set.seed(894831)
+BIC <- mclustBIC(data_norm[,1:11])
+
+
+plot(BIC)
+
+```
+
+
+```{r}
+summary(BIC)
+```
+La selección del número de clusters mediante el valor de BIC con la función MClust devuelve el único valor de 1. Notar otra vez más: no se consigue un clústering que esté cercano a la clasificación deseada (binaria). Notar también que se selecciona la opción de un solo cluster para todos los datos: no se encuentran diferencias relevantes dentro de scatterplots de variables continuas. Otra vez más se tiene confirmado: las variables por separado no ofrecen una diferenciación entre los casos hepáticos y no hepáticos al carecer de casi cualquier estructura interna descifrable.
+ 
+
+```{r}
+set.seed(894831)
+mix.clust <- Mclust(data_clust)
+plot(mix.clust,what="classification")
+```
+
+# Test-Train split
+
+Para evitar contaminar la variable, a efectos de entrenamiento de modelos, primero separaramos el conjunto de datos orignal no procesado en un conjunto de entrenamiento y otro de test guardando la proporcion de casos positivos y negativos en cada muestra en acuerdo con su proporcion en el conjunto total.
+
+```{r}
+set.seed(894831)
+trainIndex <- createDataPartition(data$Class, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train <- data[trainIndex,]
+test <- data[-trainIndex,]
+```
+
+El conjunto de entrenamiento es luego normalizado. Los mismos valores de media y desviación se aplican también para escalar el conjunto test y no indtroducir sesgos innecesarios.
+
+```{r}
+preProcValues <- preProcess(train, method = c("center", "scale"))
+
+train <- predict(preProcValues, train)
+test <- predict(preProcValues, test)
+```
+
+Es muy probable que, debido a la composición particular del conjunto de datos la partición train-test no sea la mejor opción de evaluación de modelos. Notar que la presencia de muchos valores anómalos en variables y también el disbalance de clases pueden introducir un sample bias en el entrenamiento (los hay valores "raros" suficientes y el modelo no generaliza) y en la evaluación del rendimiento final del modelo (hay muchos valores "raros" en conjunto test que no se han visto en el entrenamiento). Por lo que lo ideal sería medir el rendimiento de los modelos en una validación cruzada o con métodos bootstrap. Sin embargo, en un principio, se arrancan los modelos con una partición de datos train-test clásica. La selección ofrece posibilidades de ver fácilmente las matrices de confusión de modelos y todas las métricas deseadas. Al final del trabajo, una vez vistos los algoritmos o tipos de modelos buenos para el tratamiento de datos disponibles, se puede estimar el rendimiento de los modelos con los métodos más apropiados.
+
+# Árbol de partición
+
+## Base
+
+En un primer lugar se estudia la posibilidad de usar un árbol de partición para clasificar a los pacientes en hepáticos y no hepáticos. Dentro de la biblioteca Caret se utiliza el método "rpart" que requiere el ajuste de un único hiperparámetro de complejidad: en un sentido muy general el tamaño del árbol. La selección del valor óptimo se realiza en un proceso de validación cruzada repetida (5 repeticiones con 5 hojas) y la métrica para la selección es ROC: para la clasificación binaria es análago a exactitud (accuracy).
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     )
+```
+
+
+```{r}
+set.seed(894831)
+
+rpart.fit <- caret::train(train[,1:11], train[,12], method = "rpart", 
+                trControl = ctrl,
+                     metric="ROC",
+                tuneLength = 20)
+```
+
+```{r}
+rpart.fit
+```
+
+```{r}
+plot(rpart.fit)
+```
+
+La gráfica de variación de ROC en función del valor del parámetro de complejidad tiene claros picos que corresponden a mejores valores. Sin embargo, la variación real del valor de ROC no supera ni un 2% por lo que todos los valores llevan a mas o menos el mismo resultado. Observar que la sensitividad de los modelos ronda alrededor de 80% (la proporción de los positivos correctamente identificados por el modelo frente a todos los positivos) pero la especificidad no sube el límite de 37% (proporcion de negativos correctamente identificados). Teniendo en cuenta que los negativos ya son escasos en el conjunto, se trata de valores muy bajos.
+
+```{r}
+fancyRpartPlot(rpart.fit$finalModel)
+```
+Las predicciones sobre el conjunto test pueden dar un poco más información específica. Menos de 40% de casos negativos se identifican correctamente, mientras que más de 80% de los positivos se marcan como debe. La exactitud del modelo es de unos 70% (inflada al ser la clase positiva sobrerepresentada), pero el p-valor de 0.62 no rechaza la hipótesis de que una exactidud similar podría obtenerse al asignar todos los valores del conjunto a la clase mayoritaria ([Acc > NIR]). Adicionalmente, el test de Mcnemar indica que no rechaza la hipótesis de que la proporción entre las clases en las predicciones es la misma que en las clases observadas.
+
+El valor del índice kappa es muy bajo indicando que hay tan solo una ligera concordancia entre la clasificación del modelo y valores reales.
+
+```{r}
+xtabs(~predict(rpart.fit, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+```
+
+Para aumentar la clasificación de los casos negativos una manera habitual es cambiar el límite de probabilidad para la asignación de clases: clasificación como "Si" si la probabilidad de su asignación es mayor de 0.33 (alternativamente se prueban valores de 0.66). Sin embargo, los resultados no mejoran.
+
+```{r}
+fittedProb <- predict(rpart.fit, newdata=test, type = "prob")
+fittedProb <- fittedProb$Si
+fittedProb <- factor(ifelse(fittedProb >= 0.66, "Si", "No"))
+
+fittedProb <- factor(fittedProb, levels = c("Si", "No"))
+xtabs(~fittedProb+test$Class) %>% caret::confusionMatrix(, positive="Si")
+```
+
+
+```{r}
+imp <- varImp(rpart.fit, scale = FALSE)
+plot(imp)
+```
+El problema claro del modelo anterior es el conjunto de datos no balanceado utilizado para el entrenamiento. Para mejorar la situación pueden emplearse diversos métodos de remuestreo que tienen como objetivo igualar la presencia de las clases en un conjunto de entrenamiento. Así son las técnicas de up- y down- sampling, SMOTE and ROSE.
+
+
+## Resampling
+
+Down-sampling: dejar como está la clase minoritaria y muestrear la clase mayoritaria para que tenga la misma incidencia en el conjunto. El problema clave de este método es que limita severamente el conjunto en el caso de no haber muchos registros desde principio.
+
+Up-sampling: dejar la clase mayoritaria como está y hacer un muestreo con reemplazamiento de la clase minoritaria para igualar la incidencia. En este caso, obviamente pueden repetirse los registros no representativos de la clase negativa e itroducirse un sesgo.
+
+SMOTE y ROSE: tienen como objetivo sintetizar nuevos datos de la clase minoritaria mientras que hacen un down-sampling de la clase mayoritaria.
+
+A continuación los resultados correspondientes a estas 4 técnicas de remuestreo.
+
+```{r}
+ctrl.down <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "down")
+
+set.seed(894831)
+
+rpart.fit.down <- caret::train(train[,1:11], train[,12], method = "rpart", 
+                trControl = ctrl.down,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.down
+
+plot(rpart.fit.down)
+
+fancyRpartPlot(rpart.fit.down$finalModel)
+
+xtabs(~predict(rpart.fit.down, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+fittedProb <- predict(rpart.fit.down, newdata=test, type = "prob")
+fittedProb <- fittedProb$Si
+fittedProb <- factor(ifelse(fittedProb >= 0.33, "Si", "No"))
+
+fittedProb <- factor(fittedProb, levels = c("Si", "No"))
+xtabs(~fittedProb+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+imp.down <- varImp(rpart.fit.down, scale = FALSE)
+plot(imp.down)
+```
+
+
+
+
+```{r}
+ctrl.up <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "up")
+
+set.seed(894831)
+
+rpart.fit.up <- caret::train(train[,1:11], train[,12], method = "rpart", 
+                trControl = ctrl.up,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.up
+
+plot(rpart.fit.up)
+
+fancyRpartPlot(rpart.fit.up$finalModel)
+
+xtabs(~predict(rpart.fit.up, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+
+fittedProb <- predict(rpart.fit.up, newdata=test, type = "prob")
+fittedProb <- fittedProb$Si
+fittedProb <- factor(ifelse(fittedProb >= 0.33, "Si", "No"))
+
+fittedProb <- factor(fittedProb, levels = c("Si", "No"))
+xtabs(~fittedProb+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+imp.up <- varImp(rpart.fit.up, scale = FALSE)
+plot(imp.up)
+```
+
+
+
+```{r}
+ctrl.rose <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "rose")
+
+set.seed(894831)
+
+rpart.fit.rose <- caret::train(train[,1:11], train[,12], method = "rpart", 
+                trControl = ctrl.rose,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.rose
+
+plot(rpart.fit.rose)
+
+fancyRpartPlot(rpart.fit.rose$finalModel)
+
+xtabs(~predict(rpart.fit.rose, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+fittedProb <- predict(rpart.fit.rose, newdata=test, type = "prob")
+fittedProb <- fittedProb$Si
+fittedProb <- factor(ifelse(fittedProb >= 0.33, "Si", "No"))
+
+fittedProb <- factor(fittedProb, levels = c("Si", "No"))
+xtabs(~fittedProb+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+imp.rose <- varImp(rpart.fit.rose, scale = FALSE)
+plot(imp.rose)
+```
+
+```{r}
+ctrl.smote <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "smote")
+
+set.seed(894831)
+
+rpart.fit.smote <- caret::train(train[,1:11], train[,12], method = "rpart", 
+                trControl = ctrl.smote,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.smote
+
+plot(rpart.fit.smote)
+
+fancyRpartPlot(rpart.fit.smote$finalModel)
+
+xtabs(~predict(rpart.fit.smote, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+fittedProb <- predict(rpart.fit.smote, newdata=test, type = "prob")
+fittedProb <- fittedProb$Si
+fittedProb <- factor(ifelse(fittedProb >= 0.33, "Si", "No"))
+
+fittedProb <- factor(fittedProb, levels = c("Si", "No"))
+xtabs(~fittedProb+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+imp.smote <- varImp(rpart.fit.smote, scale = FALSE)
+plot(imp.smote)
+```
+
+Una comparación de los diferentes modelos se realiza a través del resampling.
+
+```{r}
+
+results <- resamples(list(base=rpart.fit, up=rpart.fit.up, down=rpart.fit.down, rose=rpart.fit.rose,
+                          smote = rpart.fit.smote))
+
+summary(results)
+
+
+bwplot(results)
+
+
+dotplot(results)
+
+
+```
+El valor de ROC de todos los modelos es aproximadamente el mismo, con cambios minúsculos. Notar que en el caso del sub-muestreo ROSE el modelo resultante consigue una gran especificidad (proporcion de negativos correctamente identificados) pero en cambio la sensibilidad muy baja: tiende a clasificar como negativos a casi todos los casos. El modelo base tiene un comportamiento excatamnete al revés: considera como positivos casi todos los casos. Debido a esto no resulta posible combinar los dos modelos para conseguir una mejor clasificación.
+
+Se presentan a continuación a modo ejemplo las curva ROC correspondiente al modelo con re-muestreo up-sampling.
+
+
+
+```{r}
+
+ROCit_obj <- rocit(score=predict(rpart.fit.up, newdata=test, type = "prob")[,1],class=test$Class, method="empirical",negref="No")
+plot(ROCit_obj)
+
+ciROC(ROCit_obj) %>% plot()
+
+ksplot(ROCit_obj)
+
+liftplot<-lift(Class~ predict(rpart.fit.up, newdata=test, type = "prob")[,2], data=test,  class="No")
+
+xyplot(liftplot, auto.key=TRUE, plot="gain")
+```
+
+
+Notar que el uso de representacion de datos en componentes principales no lleva a mejora de resultados, por lo que de aquí en adelante no se considera esta opción.
+
+```{r}
+PC <- princomp(~age + gender.Female + gender.Male + TB + DB + Alkphos + Sgpt + Sgot + TP + ALB + AG, cor=TRUE, 
+  data=train)
+
+train_PC <- predict(PC, train)
+test_PC <- predict(PC, test)
+```
+
+```{r}
+set.seed(894831)
+
+rpart.fit.up.PC <- caret::train(train_PC, train[,12], method = "rpart", 
+                trControl = ctrl.up,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.up.PC
+
+plot(rpart.fit.up.PC)
+
+fancyRpartPlot(rpart.fit.up.PC$finalModel)
+
+xtabs(~predict(rpart.fit.up.PC, newdata=test_PC, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+```
+
+
+# Random Forest
+
+Se seleccióna el algoritmo RF por su facilidad de interpretación y rapidez en ajuste. Su idea principal es construir muchos arboles diferentes durante el entrenamiento y considerar la clasificación final por el voto mayoritario de los clasificadores individuales. El único hiperparámetro, el número de variables seleccionadas al azar, se ajusta en el proceso de validación cruzada.
+
+```{r}
+set.seed(894831)
+
+rf.fit <- caret::train(train[,1:11], train[,12], method = "rf", 
+                trControl = ctrl,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit
+
+plot(rf.fit)
+
+xtabs(~predict(rf.fit, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+rpartVarImp <- varImp(rf.fit)
+plot(rpartVarImp)
+
+```
+
+
+
+
+
+
+
+
+```{r}
+set.seed(894831)
+
+rf.fit.up <- caret::train(train[,1:11], train[,12], method = "rf", 
+                trControl = ctrl.up,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.up
+
+plot(rf.fit.up)
+
+xtabs(~predict(rf.fit.up, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+rpartVarImp <- varImp(rf.fit.up)
+plot(rpartVarImp)
+
+```
+
+
+```{r}
+set.seed(894831)
+
+rf.fit.down <- caret::train(train[,1:11], train[,12], method = "rf", 
+                trControl = ctrl.down,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.down
+
+plot(rf.fit.down)
+
+
+xtabs(~predict(rf.fit.down, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+rpartVarImp <- varImp(rf.fit.down)
+plot(rpartVarImp)
+
+```
+
+
+```{r}
+set.seed(894831)
+
+rf.fit.rose <- caret::train(train[,1:11], train[,12], method = "rf", 
+                trControl = ctrl.rose,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.rose
+
+plot(rf.fit.rose)
+
+xtabs(~predict(rf.fit.rose, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+rpartVarImp <- varImp(rf.fit.rose)
+plot(rpartVarImp)
+
+```
+
+```{r}
+set.seed(894831)
+
+rf.fit.smote <- caret::train(train[,1:11], train[,12], method = "rf", 
+                trControl = ctrl.smote,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.smote
+
+plot(rf.fit.smote)
+
+xtabs(~predict(rf.fit.smote, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+rpartVarImp <- varImp(rf.fit.smote)
+plot(rpartVarImp)
+
+```
+
+
+
+```{r}
+
+results <- resamples(list(base=rf.fit, up=rf.fit.up, down=rf.fit.down, rose=rf.fit.rose,
+                          smote = rf.fit.smote))
+
+summary(results)
+
+
+bwplot(results)
+
+
+dotplot(results)
+
+```
+
+Los resultados de las métricas deseadas (exactitud, sensibilidad, especificidad o kappa) crecen en comparación con los valores, sin embargo siguen siendo bastante bajos. Los patrones vistos en el caso de los árboles individuales para los modelos base y rose se repiten aquí tambén (sensibilidad alta y especificidad baja para base, al revés rose) por lo que se deduce que no son óptimos para el problema.
+
+Ausencia de resultados significativos puede indicar problemas con el conjunto de entrenamiento. Como ya se ha indicado, un conjunto mal balanceado como el presente, puede requerir que la muestra de datos sea lo más completo posible.
+
+```{r}
+ROCit_obj <- rocit(score=predict(rf.fit.up, newdata=test, type = "prob")[,1],class=test$Class, method="empirical",negref="No")
+plot(ROCit_obj)
+ciROC(ROCit_obj) %>% plot()
+
+ksplot(ROCit_obj)
+
+
+liftplot<-lift(Class~ predict(rf.fit.up, newdata=test, type = "prob")[,2], data=test,  class="No")
+
+xyplot(liftplot, auto.key=TRUE, plot="gain")
+```
+
+
+## Influencia de outliers sobre las predicciones
+
+Como se ha visto, varios tipos
+Conclusiones: hay problemas severas en clase NO (menos populada). Mitad de clasificaciones en esta clase son erroneas.
+
+Quiero ver cuales son los que se clasifican erroneamente. A ver si son outliers
+Quiero ver que pasa si elimino todos los outliers a mano del train.
+
+
+```{r}
+xtabs(~predict(rf.fit.up, newdata=test, type="raw")+test$Class) %>% confusionMatrix(, positive="Si")
+```
+
+```{r}
+a1 <-which(predict(rf.fit.up, newdata=test, type="raw") == "No", arr.ind = TRUE)
+a2 <- which(test$Class == "Si", arr.ind = TRUE)
+```
+
+```{r}
+indexes <- intersect(a1,a2)
+```
+
+```{r}
+rownames(test)[indexes]
+```
+
+Ver si son los outliers
+
+```{r}
+boxTB <- boxplot(TB ~ Class, data=data, id=list(method="y"), plot = FALSE)
+out_TB <- which(data$TB %in% boxTB$out)
+
+boxDB <- boxplot(DB ~ Class, data=data, id=list(method="y"), plot = FALSE)
+out_DB <- which(data$DB %in% boxDB$out)
+
+boxAlk <- boxplot(Alkphos ~ Class, data=data, id=list(method="y"), plot = FALSE)
+out_Alk <- which(data$Alkphos %in% boxAlk$out)
+
+boxSgpt <- boxplot(Sgpt ~ Class, data=data, id=list(method="y"), plot = FALSE)
+out_Sgpt <- which(data$Sgpt %in% boxSgpt$out)
+
+boxSgot <- boxplot(Sgot ~ Class, data=data, id=list(method="y"), plot = FALSE)
+out_Sgot <- which(data$Sgot %in% boxSgot$out)
+
+outliers <- union(out_TB, out_DB)
+outliers <- union(outliers,out_Alk)
+outliers <- union(outliers,out_Sgpt)
+outliers <- union(outliers,out_Sgot)
+unique <- Filter(function(x) length(grep(x, outliers))==1, outliers)
+
+```
+
+
+```{r}
+intersect(indexes,unique)
+```
+
+# Perceptrón Multicapa
+
+Como un último recurso, se opta por ajustar un modelo de tipo perceptrón multicapa para los datos. Constituye parte de métodos conocidos como redes neuronales artificiales. Su uso va a requerir recodificación de la variable gender como numérica 
+
+Un único hiperparámetro a ajustar: el número de capas ocultas.
+
+```{r}
+set.seed(894831)
+
+pm.fit <- train(train[,1:11], train[,12], method = "mlp", 
+                trControl = ctrl,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit
+
+plot(pm.fit)
+
+rpartVarImp <- varImp(pm.fit)
+plot(rpartVarImp)
+
+xtabs(~predict(pm.fit, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+```
+
+
+
+```{r}
+set.seed(894831)
+
+pm.fit.up <- caret::train(train[,1:11], train[,12], method = "mlp", 
+                trControl = ctrl.up,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.up
+
+plot(pm.fit.up)
+
+rpartVarImp <- varImp(pm.fit.up)
+plot(rpartVarImp)
+
+xtabs(~predict(pm.fit.up, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+```
+
+
+```{r}
+set.seed(894831)
+
+pm.fit.down <- caret::train(train[,1:11], train[,12], method = "mlp", 
+                trControl = ctrl.down,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.down
+
+plot(pm.fit.down)
+
+rpartVarImp <- varImp(pm.fit.down)
+plot(rpartVarImp)
+
+xtabs(~predict(pm.fit.down, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+```
+
+
+```{r}
+set.seed(894831)
+
+pm.fit.rose <- caret::train(train[,1:11], train[,12], method = "mlp", 
+                trControl = ctrl.rose,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.rose
+
+plot(pm.fit.rose)
+
+rpartVarImp <- varImp(pm.fit.rose)
+plot(rpartVarImp)
+
+xtabs(~predict(pm.fit.rose, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+
+```
+
+```{r}
+set.seed(894831)
+
+pm.fit.smote <- caret::train(train[,1:11], train[,12], method = "mlp", 
+                trControl = ctrl.smote,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.smote
+
+plot(pm.fit.smote)
+
+rpartVarImp <- varImp(pm.fit.smote)
+plot(rpartVarImp)
+
+xtabs(~predict(pm.fit.smote, newdata=test, type="raw")+test$Class) %>% caret::confusionMatrix(, positive="Si")
+
+
+```
+
+
+
+
+```{r}
+results <- resamples(list(base=pm.fit, up=pm.fit.up, down=pm.fit.down, rose=pm.fit.rose,
+                          smote = pm.fit.smote))
+
+summary(results)
+
+
+bwplot(results)
+
+
+
+dotplot(results)
+
+
+```
+
+
+Los resultados del perceptrón multicapa no mejoran mucho los obtenidos con random forest en términos de valores de exactidus, sensibilidad o especificidad particulares. Sin embargo mejora el índice kappa: las predicciones concuerdan más con los valores reales en el conjunto test. Además, las técnicas de resampling tipo up-sampling y SMOTE siguen ofreciendo los mejores resultados para las tres métricas.
+
+
+```{r}
+ROCit_obj <- rocit(score=predict(pm.fit.up, newdata=test, type = "prob")[,1],class=test$Class, method="empirical",negref="No")
+plot(ROCit_obj)
+
+ciROC(ROCit_obj) %>% plot()
+
+ksplot(ROCit_obj)
+
+
+liftplot<-lift(Class~ predict(rf.fit.up, newdata=test, type = "prob")[,2], data=test,  class="No")
+
+xyplot(liftplot, auto.key=TRUE, plot="gain")
+```
+
+
+# Conclusiones preliminares
+
+1. Usar todo el conjunto para entrenamiento
+2. Usar técnicas de up-sampling y SMOTE para hacer un resampling de datos (no se ha visto que una sea constantemente mejor que la otra asi que usar las dos)
+
+
+# Modelos sobre conjunto total de datos
+
+Árbol de partición: rpart.fit.up.final, rpart.fit.smote.final
+Random Forest: rf.fit.up.final, rf.fit.smote.final
+Perceptrón Multicapa: pm.fit.up.final, pm.fit.smote.final
+
+
+```{r}
+
+set.seed(894831)
+
+ctrl.up.final <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "up",
+                     savePredictions = "final")
+
+rpart.fit.up.final <- caret::train(data[,1:11], data[,12], method = "rpart", 
+                trControl = ctrl.up.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.up.final
+
+plot(rpart.fit.up.final)
+
+fancyRpartPlot(rpart.fit.up.final$finalModel)
+
+imp.up <- varImp(rpart.fit.up.final, scale = FALSE)
+plot(imp.up)
+
+confusionMatrix(rpart.fit.up.final$pred$pred, rpart.fit.up.final$pred$obs)
+
+```
+
+
+```{r}
+
+set.seed(894831)
+
+ctrl.smote.final <- trainControl(method = "repeatedcv", number = 5, repeats = 5,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     sampling = "smote",
+                     savePredictions = "final")
+
+rpart.fit.smote.final <- caret::train(data[,1:11], data[,12], method = "rpart", 
+                trControl = ctrl.smote.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+rpart.fit.smote.final
+
+plot(rpart.fit.smote.final)
+
+fancyRpartPlot(rpart.fit.smote.final$finalModel)
+
+imp.smote <- varImp(rpart.fit.smote.final, scale = FALSE)
+plot(imp.smote)
+
+confusionMatrix(rpart.fit.smote.final$pred$pred, rpart.fit.smote.final$pred$obs)
+
+```
+```{r}
+
+set.seed(894831)
+
+rf.fit.up.final <- caret::train(data[,1:11], data[,12], method = "rf", 
+                trControl = ctrl.up.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.up.final
+
+plot(rf.fit.up.final)
+
+imp.up <- varImp(rf.fit.up.final, scale = FALSE)
+plot(imp.up)
+
+confusionMatrix(rf.fit.up.final$pred$pred, rf.fit.up.final$pred$obs)
+
+```
+```{r}
+
+set.seed(894831)
+
+rf.fit.smote.final <- caret::train(data[,1:11], data[,12], method = "rf", 
+                trControl = ctrl.smote.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+rf.fit.smote.final
+
+plot(rf.fit.smote.final)
+
+imp.smote <- varImp(rf.fit.smote.final, scale = FALSE)
+plot(imp.smote)
+
+confusionMatrix(rf.fit.smote.final$pred$pred, rf.fit.smote.final$pred$obs)
+
+```
+```{r}
+
+set.seed(894831)
+
+pm.fit.up.final <- caret::train(data[,1:11], data[,12], method = "mlp", 
+                trControl = ctrl.up.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.up.final
+
+plot(pm.fit.up.final)
+
+imp.up <- varImp(pm.fit.up.final, scale = FALSE)
+plot(imp.up)
+
+confusionMatrix(pm.fit.up.final$pred$pred, pm.fit.up.final$pred$obs)
+
+```
+
+```{r}
+
+set.seed(894831)
+
+pm.fit.smote.final <- caret::train(data[,1:11], data[,12], method = "mlp", 
+                trControl = ctrl.smote.final,
+                     metric="ROC",
+                tuneLength = 20)
+
+pm.fit.smote.final
+
+plot(pm.fit.smote.final)
+
+imp.smote <- varImp(pm.fit.smote.final, scale = FALSE)
+plot(imp.smote)
+
+confusionMatrix(pm.fit.smote.final$pred$pred, pm.fit.smote.final$pred$obs)
+
+```
+
+
+
+```{r}
+results <- resamples(list(rpart.up=rpart.fit.up.final, rpart.smote=rpart.fit.smote.final, rf.up=rf.fit.up.final, rf.smote=rf.fit.smote.final,pm.up=pm.fit.up.final, pm.smote=pm.fit.smote.final))
+
+summary(results)
+
+bwplot(results)
+
+dotplot(results)
+
+```
+
+Notar que los modelos tipo perceptrón múlticapa varia mucho en sensibilidad y especificidad, hasta el punto cuando su valor de kappa total en la validación cruzada es de 0.01 aproximadamente (un valor que indica casi asusencia de concordancia entre valores predichos y observados). A persar de que los modelos tipo perceptrón devolvían resultados relativamente buenos en el conjunto de test, concluir que se trataba de un sample bias.
+
+Los modelos tipo random forest tienen muy buena sensibilidad (calsifican muchisimos casos positivos bien) y una especificidad de alrededor de 50%. Eso es, en aproximadamente mitad de los casos, un paciente clasificado como sano es en realidad enfermo. Sin emabrgo, esos son los modelos de mejor valor de ROC (aunque la mejora no es mucho).
+
+Los modelos tipo árboles de partición ofrecen una sensibilidad y especificidad moderada por encima de 50% ambas, pero no demasiado altos.
+
+En general, todos los modelos tienen el índice de concordacia kappa muy bajos, auqnue una comparación directa entre los valores de kappa en validación cruzada 5-5 en todo el conjunto de datos y en una validación en el conjunto de test limitado no es de todo correcta. Además en ningún caso se rechaza la hipótesis de que la clasificación ofrecida es diferente a una alcanzada por NIR (no information rate, asignación a todos los casos a la clase mayoritaria).
+
+Notar que en este caso una comparación de curvas ROC no tiene sentido al ser el conjunto de entrenamiento el total. 
+
+# Conclusiones
+
+El trabajo realizado se concluye en los siguientes puntos:
+
+1. Un estudio preliminar de los datos señaló que existen ciertas relaciones de casi todas las variables explicativas con la variable de clasificación. Sin embargo un estudio de agrupaciones internas dentro del conjunto en total (análisis PCA y clustering) no ha indicado una diferencia apreciable entre los casos de diferentes clases: los valores están extraordinariamente mezclados en el espacio de las 3 primeras componentes principales (61% de variabilidad total de la muestra). Los resultados indican, que obtener unos clasificadores buenos sobre el conjunto va a ser díficil.
+
+1. El conjunto de datos analizado es muy mal balanceado. Menos de un 30% de los registros correspondian a los pacientes sanos, mientras que el resto eran enfermos. Este hecho, junto con el tamaño del conjunto total, hizo que sea muy difícil generalizar la información sobre los pacientes sanos lo que claramente dificulta su detección.
+
+Para mitigar el problema, se han empleado varias técnicas de remuestreo. Algunas de ellas (como el up-sampling y ROSE) han conducido a resultados mejores que otras técnicas.
+
+2. Se han ajsutado varios modelos de tipo árbol de partición, random forest y perceptrón multicapa. Sus correspondientes hiperparámetros se han ajustado en el  En el conjunto test aleatorio (el mismo para todos los modelos) ninguno de los modelos ha conseguido buenos resultados tanto en sensibilidad como en sensitividad a la vez. El índice de concordancia kappa no ha superado el 0.41 indicando concordancia baja entre los valores reales y predichos.
+
+3. Se ha supuesto, que los resultados se deben a la partición train-test del conjunto inicial de datos. Aunque la partición se ha realizado conservando la proporción de casos de cada clase, quizá la escasez de datos ha sido demasiado grande para que los modelos puedan generalizar bien fuera de los casos conocidos.
+
+Para solucionar el problema, se ha propuesto una evaluación del rendimiento de los modelos en validación cruzada, utilizando todos los datos disponibles. Sin embargo, los resultados en una validación cruzada 5-5 (hojas-repeticiones) han sido peores que en el caso de un conjunto test dedicado.
+
+En ningun caso y para ningun modelo se ha rechazado la hipóteis de que la exactitud de la predicción ofrecida es significativamente mejor que la que podría obtenerse en un caso de información nula (NoInformationRate, asignación de todos los casos a la clase mayoritaria). 
+
